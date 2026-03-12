@@ -640,6 +640,565 @@ describe("staleWrapper", () => {
         expect(getByTestId("valueA").textContent).toBe("a2")
     })
 
+    test("isStale recovers after InnerMemo re-renders for non-MobX reasons during stale window", () => {
+        const store = mobx.observable({ value: 1 })
+        const { scheduler, flush } = createManualScheduler()
+        const deferredObserver = scheduledObserver(scheduler)
+
+        const Component = deferredObserver(
+            function Component({ label }: { label: string }) {
+                return (
+                    <span data-testid="value">
+                        {label}-{store.value}
+                    </span>
+                )
+            },
+            (children, isStale) => (
+                <div data-testid="wrapper" data-stale={String(isStale)}>
+                    {children}
+                </div>
+            )
+        )
+
+        function Parent() {
+            const [label, setLabel] = React.useState("A")
+            return (
+                <>
+                    <button data-testid="change-label" onClick={() => setLabel("B")} />
+                    <Component label={label} />
+                </>
+            )
+        }
+
+        const { getByTestId } = render(<Parent />)
+        expect(getByTestId("wrapper").dataset.stale).toBe("false")
+        expect(getByTestId("value").textContent).toBe("A-1")
+
+        // 1. Change observable → isStale=true, reaction queued
+        act(() => {
+            store.value = 2
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("true")
+        expect(getByTestId("value").textContent).toBe("A-1") // inner hasn't re-rendered
+
+        // 2. Change prop → InnerMemo re-renders (track() runs, dependenciesState_=UP_TO_DATE_)
+        act(() => {
+            getByTestId("change-label").click()
+        })
+        // Inner re-rendered with new prop AND fresh observable (track ran)
+        expect(getByTestId("value").textContent).toBe("B-2")
+
+        // 3. Flush scheduler → runReaction_() fires but shouldCompute()=false
+        //    Without fix: onInvalidate_ is skipped, onFresh never fires, isStale stuck true
+        act(() => {
+            flush()
+        })
+
+        // isStale must recover to false
+        expect(getByTestId("wrapper").dataset.stale).toBe("false")
+    })
+
+    test("subsequent stale/fresh cycles work after safety-net recovery", () => {
+        // After the useLayoutEffect safety net clears isStale from a prop-change
+        // during the stale window, subsequent stale/fresh cycles must still work.
+        // This validates that isScheduled is properly cleared by runReaction_(),
+        // so the next schedule_() call invokes our callback and onStale fires.
+        const store = mobx.observable({ value: 1 })
+        const { scheduler, flush } = createManualScheduler()
+        const deferredObserver = scheduledObserver(scheduler)
+
+        const Component = deferredObserver(
+            function Component({ label }: { label: string }) {
+                return (
+                    <span data-testid="value">
+                        {label}-{store.value}
+                    </span>
+                )
+            },
+            (children, isStale) => (
+                <div data-testid="wrapper" data-stale={String(isStale)}>
+                    {children}
+                </div>
+            )
+        )
+
+        function Parent() {
+            const [label, setLabel] = React.useState("A")
+            return (
+                <>
+                    <button data-testid="change-label" onClick={() => setLabel("B")} />
+                    <Component label={label} />
+                </>
+            )
+        }
+
+        const { getByTestId } = render(<Parent />)
+
+        // Trigger the safety-net recovery path
+        act(() => {
+            store.value = 2
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("true")
+
+        act(() => {
+            getByTestId("change-label").click()
+        })
+        // useLayoutEffect safety net fires → isStale=false
+        act(() => {
+            flush()
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("false")
+
+        // Now verify the NEXT stale/fresh cycle works normally.
+        // isScheduled was cleared by runReaction_(), so schedule_() should
+        // invoke our callback and onStale should fire.
+        act(() => {
+            store.value = 3
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("true")
+        expect(getByTestId("value").textContent).toBe("B-2") // not yet updated
+
+        act(() => {
+            flush()
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("false")
+        expect(getByTestId("value").textContent).toBe("B-3")
+    })
+
+    test("second observable change between safety-net recovery and scheduler flush", () => {
+        // After the useLayoutEffect safety net fires but BEFORE the scheduler flushes,
+        // a second observable change happens. Because isScheduled is still true,
+        // schedule_() is a no-op — our onStale callback is NOT called for the second change.
+        // But when the scheduler flushes, shouldCompute() returns true (second change),
+        // onInvalidate_ fires, and the component must end up fresh with correct data.
+        const store = mobx.observable({ a: 1, b: 10 })
+        const { scheduler, flush } = createManualScheduler()
+        const deferredObserver = scheduledObserver(scheduler)
+
+        const Component = deferredObserver(
+            function Component({ label }: { label: string }) {
+                return (
+                    <span data-testid="value">
+                        {label}-{store.a}-{store.b}
+                    </span>
+                )
+            },
+            (children, isStale) => (
+                <div data-testid="wrapper" data-stale={String(isStale)}>
+                    {children}
+                </div>
+            )
+        )
+
+        function Parent() {
+            const [label, setLabel] = React.useState("X")
+            return (
+                <>
+                    <button data-testid="change-label" onClick={() => setLabel("Y")} />
+                    <Component label={label} />
+                </>
+            )
+        }
+
+        const { getByTestId } = render(<Parent />)
+        expect(getByTestId("value").textContent).toBe("X-1-10")
+
+        // Observable A changes → stale, reaction scheduled
+        act(() => {
+            store.a = 2
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("true")
+
+        // Prop change → InnerMemo re-renders → track() reads a=2, b=10 → safety net → fresh
+        act(() => {
+            getByTestId("change-label").click()
+        })
+        expect(getByTestId("value").textContent).toBe("Y-2-10")
+
+        // Observable B changes while isScheduled is still true
+        // schedule_() is a no-op, but dependenciesState_ becomes STALE
+        act(() => {
+            store.b = 20
+        })
+
+        // Scheduler flushes → shouldCompute()=true (B changed) → onInvalidate_ → fresh
+        act(() => {
+            flush()
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("false")
+        expect(getByTestId("value").textContent).toBe("Y-2-20")
+    })
+
+    test("multiple prop changes during stale window all recover", () => {
+        const store = mobx.observable({ value: 1 })
+        const { scheduler, flush } = createManualScheduler()
+        const deferredObserver = scheduledObserver(scheduler)
+
+        const Component = deferredObserver(
+            function Component({ count }: { count: number }) {
+                return (
+                    <span data-testid="value">
+                        {count}-{store.value}
+                    </span>
+                )
+            },
+            (children, isStale) => (
+                <div data-testid="wrapper" data-stale={String(isStale)}>
+                    {children}
+                </div>
+            )
+        )
+
+        function Parent() {
+            const [count, setCount] = React.useState(0)
+            return (
+                <>
+                    <button data-testid="inc" onClick={() => setCount(c => c + 1)} />
+                    <Component count={count} />
+                </>
+            )
+        }
+
+        const { getByTestId } = render(<Parent />)
+
+        // Go stale
+        act(() => {
+            store.value = 2
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("true")
+
+        // First prop change → track() → safety net clears isStale
+        act(() => {
+            getByTestId("inc").click()
+        })
+        expect(getByTestId("value").textContent).toBe("1-2")
+
+        // Second prop change → track() again, useLayoutEffect fires again
+        // isStale_ is false (cleared by first prop change), so it's a no-op
+        act(() => {
+            getByTestId("inc").click()
+        })
+        expect(getByTestId("value").textContent).toBe("2-2")
+
+        // Flush — shouldCompute=false, no-op
+        act(() => {
+            flush()
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("false")
+        expect(getByTestId("value").textContent).toBe("2-2")
+    })
+
+    test("prop change without observable change does not falsely trigger stale", () => {
+        const store = mobx.observable({ value: 1 })
+        const { scheduler, flush } = createManualScheduler()
+        const deferredObserver = scheduledObserver(scheduler)
+
+        const staleCalls: boolean[] = []
+
+        const Component = deferredObserver(
+            function Component({ label }: { label: string }) {
+                return (
+                    <span data-testid="value">
+                        {label}-{store.value}
+                    </span>
+                )
+            },
+            (children, isStale) => {
+                staleCalls.push(isStale)
+                return (
+                    <div data-testid="wrapper" data-stale={String(isStale)}>
+                        {children}
+                    </div>
+                )
+            }
+        )
+
+        function Parent() {
+            const [label, setLabel] = React.useState("A")
+            return (
+                <>
+                    <button data-testid="change-label" onClick={() => setLabel("B")} />
+                    <Component label={label} />
+                </>
+            )
+        }
+
+        const { getByTestId } = render(<Parent />)
+        staleCalls.length = 0 // reset after initial render
+
+        // Prop change WITHOUT any observable change
+        act(() => {
+            getByTestId("change-label").click()
+        })
+
+        // useLayoutEffect fires, but isStale_ is false → no-op → no false setIsStale(false)
+        expect(getByTestId("wrapper").dataset.stale).toBe("false")
+        expect(getByTestId("value").textContent).toBe("B-1")
+        // staleWrapper should NOT have been re-rendered with isStale=true at any point
+        expect(staleCalls.every(s => s === false)).toBe(true)
+    })
+
+    test("computed dependency recovery via stale wrapper", () => {
+        // Computed changes propagate as POSSIBLY_STALE_ which takes a different
+        // shouldCompute() path — it evaluates the computed to see if it actually changed.
+        // If track() ran during the stale window, dependenciesState_ is UP_TO_DATE_
+        // and shouldCompute() returns false, same as direct observables.
+        const store = mobx.observable({ value: 1 })
+        const derived = mobx.computed(() => store.value * 10)
+        const { scheduler, flush } = createManualScheduler()
+        const deferredObserver = scheduledObserver(scheduler)
+
+        const Component = deferredObserver(
+            function Component({ label }: { label: string }) {
+                return (
+                    <span data-testid="value">
+                        {label}-{derived.get()}
+                    </span>
+                )
+            },
+            (children, isStale) => (
+                <div data-testid="wrapper" data-stale={String(isStale)}>
+                    {children}
+                </div>
+            )
+        )
+
+        function Parent() {
+            const [label, setLabel] = React.useState("A")
+            return (
+                <>
+                    <button data-testid="change-label" onClick={() => setLabel("B")} />
+                    <Component label={label} />
+                </>
+            )
+        }
+
+        const { getByTestId } = render(<Parent />)
+        expect(getByTestId("value").textContent).toBe("A-10")
+
+        // Change underlying observable → computed goes POSSIBLY_STALE_ → reaction scheduled
+        act(() => {
+            store.value = 2
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("true")
+
+        // Prop change → InnerMemo re-renders → track() reads computed (forces recalc) → fresh
+        act(() => {
+            getByTestId("change-label").click()
+        })
+        expect(getByTestId("value").textContent).toBe("B-20")
+
+        // Flush — shouldCompute=false → no-op, safety net already cleared isStale
+        act(() => {
+            flush()
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("false")
+    })
+
+    test("subscription change during prop-triggered re-render", () => {
+        // If props determine WHICH observable is read, changing props during the
+        // stale window changes the reaction's subscriptions. After track() runs
+        // with new subscriptions, the old change is no longer relevant.
+        const storeA = mobx.observable({ value: "a1" })
+        const storeB = mobx.observable({ value: "b1" })
+        const { scheduler, flush } = createManualScheduler()
+        const deferredObserver = scheduledObserver(scheduler)
+
+        const Component = deferredObserver(
+            function Component({ source }: { source: "a" | "b" }) {
+                const val = source === "a" ? storeA.value : storeB.value
+                return <span data-testid="value">{val}</span>
+            },
+            (children, isStale) => (
+                <div data-testid="wrapper" data-stale={String(isStale)}>
+                    {children}
+                </div>
+            )
+        )
+
+        function Parent() {
+            const [source, setSource] = React.useState<"a" | "b">("a")
+            return (
+                <>
+                    <button data-testid="switch" onClick={() => setSource("b")} />
+                    <Component source={source} />
+                </>
+            )
+        }
+
+        const { getByTestId } = render(<Parent />)
+        expect(getByTestId("value").textContent).toBe("a1")
+
+        // Change storeA → stale (reaction observes storeA)
+        act(() => {
+            storeA.value = "a2"
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("true")
+
+        // Switch prop to "b" → InnerMemo re-renders → track() now reads storeB,
+        // drops subscription to storeA. dependenciesState_=UP_TO_DATE_
+        act(() => {
+            getByTestId("switch").click()
+        })
+        expect(getByTestId("value").textContent).toBe("b1")
+
+        // Flush → shouldCompute=false (subscriptions changed, new deps are fresh) → no-op
+        act(() => {
+            flush()
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("false")
+
+        // Now verify storeB changes trigger stale correctly (new subscription works)
+        act(() => {
+            storeB.value = "b2"
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("true")
+
+        act(() => {
+            flush()
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("false")
+        expect(getByTestId("value").textContent).toBe("b2")
+
+        // And storeA changes should NOT trigger stale (no longer subscribed)
+        act(() => {
+            storeA.value = "a3"
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("false")
+    })
+
+    test("no re-staling during runReaction_() gap", () => {
+        // Inside runReaction_(), isScheduled is set to false BEFORE shouldCompute()
+        // runs. If an observable changes in that window (e.g. from onInvalidate_
+        // triggering a cascading reaction), onBecomeStale_() → schedule_() would
+        // call our scheduler callback because isScheduled is now false. Without
+        // suppressStale, onStale() would fire and setIsStale(true) would race
+        // with the setIsStale(false) from onFresh.
+        //
+        // We test this by having two observables where changing one triggers a
+        // MobX autorun that changes the other. The autorun fires during
+        // runReaction_() → endBatch().
+        const store = mobx.observable({ a: 1, b: 10 })
+        const { scheduler, flush } = createManualScheduler()
+        const deferredObserver = scheduledObserver(scheduler)
+
+        // Autorun: when a changes, synchronously update b
+        const dispose = mobx.autorun(() => {
+            store.b = store.a * 10
+        })
+
+        const Component = deferredObserver(
+            function Component() {
+                return (
+                    <span data-testid="value">
+                        {store.a}-{store.b}
+                    </span>
+                )
+            },
+            (children, isStale) => (
+                <div data-testid="wrapper" data-stale={String(isStale)}>
+                    {children}
+                </div>
+            )
+        )
+
+        const { getByTestId } = render(<Component />)
+        expect(getByTestId("value").textContent).toBe("1-10")
+        expect(getByTestId("wrapper").dataset.stale).toBe("false")
+
+        // Change a → stale, reaction scheduled
+        act(() => {
+            store.a = 2
+        })
+        expect(getByTestId("wrapper").dataset.stale).toBe("true")
+
+        // Flush: runReaction_() fires. During endBatch(), the autorun runs
+        // and changes b. This triggers our reaction's onBecomeStale_() →
+        // schedule_() (isScheduled was reset to false). suppressStale
+        // prevents onStale from firing during this window.
+        act(() => {
+            flush()
+        })
+
+        // Must be fresh — the cascading change should NOT leave isStale stuck
+        expect(getByTestId("wrapper").dataset.stale).toBe("false")
+        expect(getByTestId("value").textContent).toBe("2-20")
+
+        dispose()
+    })
+
+    test("no re-staling from computed recalculation during track()", () => {
+        // When track() runs, reading a computed that depends on a changed
+        // observable can trigger the computed to recalculate. If the computed's
+        // value changes, it calls propagateChangeConfirmed which can mark
+        // downstream derivations as STALE, potentially triggering
+        // onBecomeStale_() → schedule_() → our scheduler callback.
+        // suppressStale around track() prevents this from firing onStale().
+        //
+        // We use useScheduledObserver directly (no stale wrapper) to observe
+        // the raw onStale/onFresh callbacks without outer component re-renders
+        // muddying the signal.
+        const store = mobx.observable({ value: 1 })
+        const derived = mobx.computed(() => store.value * 10)
+        const { scheduler, flush } = createManualScheduler()
+
+        const staleCalls: string[] = []
+
+        function Component({ label }: { label: string }) {
+            return useScheduledObserver(
+                () => (
+                    <span data-testid="value">
+                        {label}-{derived.get()}
+                    </span>
+                ),
+                scheduler,
+                "test",
+                {
+                    onStale: () => staleCalls.push("stale"),
+                    onFresh: () => staleCalls.push("fresh")
+                }
+            )
+        }
+
+        function Parent() {
+            const [label, setLabel] = React.useState("A")
+            return (
+                <>
+                    <button data-testid="change-label" onClick={() => setLabel("B")} />
+                    <Component label={label} />
+                </>
+            )
+        }
+
+        const { getByTestId } = render(<Parent />)
+        staleCalls.length = 0 // reset after initial render (useLayoutEffect fires onFresh)
+
+        // Change observable → computed becomes POSSIBLY_STALE_ → reaction stale
+        act(() => {
+            store.value = 2
+        })
+        expect(staleCalls).toEqual(["stale"])
+
+        staleCalls.length = 0
+
+        // Prop change → Component re-renders → track() runs → computed.get()
+        // forces recalculation → value changes → propagateChangeConfirmed.
+        // Without suppressStale, this would fire a second onStale mid-render.
+        act(() => {
+            getByTestId("change-label").click()
+        })
+
+        // Should only see fresh calls, no stale from the computed recalculation
+        expect(staleCalls.filter(s => s === "stale")).toEqual([])
+        expect(getByTestId("value").textContent).toBe("B-20")
+
+        // Flush — verify everything is clean
+        act(() => {
+            flush()
+        })
+        expect(staleCalls.filter(s => s === "stale")).toEqual([])
+    })
+
     test("works with forwardRef", async () => {
         const store = mobx.observable({ value: 1 })
         const { scheduler, flush } = createManualScheduler()
@@ -702,7 +1261,9 @@ describe("staleWrapper", () => {
         }
 
         render(<Component />)
-        expect(staleCalls).toEqual([])
+        // onFresh fires on initial render via useLayoutEffect (harmless baseline)
+        // and via patched runReaction_ — this is expected
+        staleCalls.length = 0
 
         act(() => {
             store.value = 2
@@ -714,7 +1275,10 @@ describe("staleWrapper", () => {
             flush()
         })
 
-        expect(staleCalls).toEqual([true, false])
+        // onFresh fires from patched runReaction_ and from useLayoutEffect
+        // on the subsequent re-render. Both are correct — for the stale wrapper
+        // case, setIsStale(false) when already false is a React no-op.
+        expect(staleCalls).toEqual([true, false, false])
     })
 
     test("stale wrapper at toolbar level dims entire toolbar", async () => {

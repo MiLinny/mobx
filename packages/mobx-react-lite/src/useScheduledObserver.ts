@@ -24,6 +24,7 @@ type ScheduledObserverAdministration = {
     scheduler: ReactionScheduler
     onStale: (() => void) | null
     onFresh: (() => void) | null
+    suppressStale: boolean
     // These don't depend on state/props, therefore we can keep them here instead of `useCallback`
     subscribe: Parameters<typeof React.useSyncExternalStore>[0]
     getSnapshot: Parameters<typeof React.useSyncExternalStore>[1]
@@ -33,7 +34,7 @@ function createScheduledReaction(adm: ScheduledObserverAdministration) {
     adm.reaction = new ScheduledReaction(
         `scheduledObserver${adm.name}`,
         () => {
-            adm.onFresh?.()
+            // onInvalidate_: just trigger re-render, no stale management here
             adm.stateVersion = Symbol()
             // onStoreChange won't be available until the component "mounts".
             // If state changes in between initial render and mount,
@@ -41,10 +42,31 @@ function createScheduledReaction(adm: ScheduledObserverAdministration) {
             adm.onStoreChange?.()
         },
         reaction => {
-            adm.onStale?.()
+            // scheduler_: reaction became stale
+            // Suppress during runReaction_() and track() to prevent
+            // setIsStale(true) from racing with setIsStale(false)
+            if (!adm.suppressStale) {
+                adm.onStale?.()
+            }
             adm.scheduler(reaction)
         }
     )
+
+    // Patch runReaction_ to always call onFresh() after execution,
+    // regardless of whether shouldCompute() returned true or false.
+    //
+    // Why: if the inner component re-renders for any reason (prop/context
+    // change) while the reaction is queued, track() runs and sets the
+    // reaction to UP_TO_DATE. When runReaction_() later fires,
+    // shouldCompute() returns false, onInvalidate_ is skipped, and
+    // onFresh() would never be called — leaving isStale stuck at true.
+    const origRunReaction = adm.reaction.runReaction_.bind(adm.reaction)
+    adm.reaction.runReaction_ = () => {
+        adm.suppressStale = true
+        origRunReaction()
+        adm.suppressStale = false
+        adm.onFresh?.()
+    }
 }
 
 /**
@@ -90,6 +112,7 @@ export function useScheduledObserver<T>(
             scheduler,
             onStale: options?.onStale ?? null,
             onFresh: options?.onFresh ?? null,
+            suppressStale: false,
             subscribe(onStoreChange: () => void) {
                 // Do NOT access admRef here!
                 observerFinalizationRegistry.unregister(adm)
@@ -152,12 +175,28 @@ export function useScheduledObserver<T>(
     // can be invalidated (see above) once a dependency changes
     let renderResult!: T
     let exception
+    // Suppress onStale during track() — computed recalculation during
+    // tracking can trigger onBecomeStale_ which would race with the
+    // fresh state we're about to establish
+    adm.suppressStale = true
     adm.reaction!.track(() => {
         try {
             renderResult = render()
         } catch (e) {
             exception = e
         }
+    })
+    adm.suppressStale = false
+
+    // Safety net: after every render where track() ran, ensure onFresh fires.
+    // This handles prop/context re-renders during the stale window where
+    // track() sets dependenciesState_ to UP_TO_DATE_, causing the later
+    // runReaction_() to skip onInvalidate_ (shouldCompute()=false).
+    // When not stale, setIsStale(false) is a React no-op.
+    // When onFresh is null (no stale wrapper), the effect body is a no-op.
+    React.useLayoutEffect(() => {
+        adm.suppressStale = false
+        adm.onFresh?.()
     })
 
     if (exception) {
